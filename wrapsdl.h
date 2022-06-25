@@ -15,7 +15,9 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL.h>
 
-#define debug(msg) fprintf(stderr, "%d: [DEBUG] %s\n", __LINE__, (msg))
+#define debug(msg)                                                             \
+	fprintf(stderr, "%s:%s:%d [DEBUG] %s\n", __FILE__, __func__, __LINE__, \
+		(msg))
 
 typedef struct rgb_T {
 	Uint8 r;
@@ -271,6 +273,7 @@ static void handle_mouse_button_up(state_T *state)
 		break;
 	}
 }
+
 static void handle_mouse_motion(state_T *state)
 {
 	state->x = state->event.motion.x;

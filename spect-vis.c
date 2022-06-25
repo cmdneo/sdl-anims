@@ -18,17 +18,19 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <stdatomic.h>
+#include <errno.h>
 #include <complex.h>
 #include <inttypes.h>
 #include <math.h>
 
 #include "wrapsdl.h"
 
-#define AMP_MAX ((double)UINT16_MAX)
+#define AMP_MAX ((double)(UINT16_MAX - 1))
 #define PI 3.1415926535897932384626433
 #define RATE 48000
 #define NSAMPLES 1024
-#define NFREQS 700
 #define AVG_LAG 4.
 #define DT (1. / RATE)
 #define FOURIER_K (2. / NSAMPLES)
@@ -37,6 +39,11 @@ typedef union audio_T {
 	int16_t amp;
 	char raw[sizeof(int16_t)];
 } audio_T;
+
+enum {
+	NFREQS = 700,
+	FREQ_BAR_MAX = 4096,
+};
 
 static const double FREQS[NFREQS] = {
 	21.734,	  21.926,   22.119,   22.314,	22.510,	  22.709,   22.909,
@@ -142,7 +149,9 @@ static const double FREQS[NFREQS] = {
 };
 
 /* Global variables */
-static double freq_avgs_g[NFREQS] = { 0 };
+static double freq_avgs_g[NFREQS];
+static atomic_int_least32_t freq_bar_g[NFREQS];
+static char *ain_fpath = "-";
 
 static inline double audio_freqs_cal(audio_T ains[static NSAMPLES], double f,
 				     double t)
@@ -156,15 +165,24 @@ static inline double audio_freqs_cal(audio_T ains[static NSAMPLES], double f,
 	}
 
 	c *= FOURIER_K;
-	/* (1 - 10^(-x)) / .9 => log scaling */
+	/* (1 - 10^(-x)) * 1.111 => log scaling, (1 / 0.9 == 1.111.....) */
+	/* Keeps in (full)range [0, 1) */
 	return (1 - pow(10., -cabs(c))) * 1.111;
 }
 
 int fourier_threaded(void *arg)
 {
 	state_T *state = (state_T *)arg;
+	FILE *ain_pipe = NULL;
+	if (strcmp("-", ain_fpath) == 0)
+		ain_pipe = stdin;
+	else if ((ain_pipe = fopen(ain_fpath, "rb")) == NULL) {
+		perror("Error opening file");
+		state->quit = 1;
+		return 1;
+	}
+
 	audio_T ains[NSAMPLES] = { 0 };
-	FILE *ain_pipe = stdin;
 	double t = 0.;
 
 	while (!state->quit) {
@@ -180,12 +198,17 @@ int fourier_threaded(void *arg)
 		for (int i = 0; i < NFREQS; i++) {
 			/* Averaage for smoothing */
 			double tmp = audio_freqs_cal(ains, FREQS[i], t);
-			freq_avgs_g[i] *= (AVG_LAG - 1.) / AVG_LAG;
-			freq_avgs_g[i] += tmp / AVG_LAG;
+			tmp = freq_avgs_g[i] * (AVG_LAG - 1.) / AVG_LAG +
+			      tmp / AVG_LAG;
+			freq_avgs_g[i] = tmp;
+			freq_bar_g[i] = freq_avgs_g[i] * FREQ_BAR_MAX;
 		}
 
 		t += DT * NSAMPLES;
 	}
+
+	if (ain_pipe != stdin)
+		fclose(ain_pipe);
 
 	return 0;
 }
@@ -208,8 +231,11 @@ static inline rgb_T colmap_hot(uint8_t x)
 	return ret;
 }
 
-int main()
+int main(int argc, char *argv[static argc + 1])
 {
+	if (argc >= 2)
+		ain_fpath = argv[1];
+
 	state_T s = {
 		.resx = 1500,
 		.resy = 900,
@@ -221,10 +247,6 @@ int main()
 	int err = state_create(&s);
 	if (err)
 		goto init_err;
-
-	SDL_mutex *freq_mtx = SDL_CreateMutex();
-	if (freq_mtx == NULL)
-		goto mtx_err;
 
 	SDL_Thread *aud_thr =
 		SDL_CreateThread(fourier_threaded, "fourier_threaded", &s);
@@ -238,14 +260,12 @@ int main()
 		if (s.error)
 			goto late_err;
 
-		if (SDL_LockMutex(freq_mtx) != 0)
-			goto late_err;
-
 		/* Draw the history on a texture, to keep it recorded */
 		SDL_SetRenderTarget(s.ren, s.rentex);
 
 		for (int i = 0; i < NFREQS; i++) {
-			rgb_T col = colmap_hot((uint8_t)(freq_avgs_g[i] * 255));
+			rgb_T col = colmap_hot(
+				(uint8_t)(255 * freq_bar_g[i] / FREQ_BAR_MAX));
 			SDL_SetRenderDrawColor(s.ren, col.r, col.g, col.b, 255);
 			SDL_RenderDrawPoint(s.ren, i, lineY);
 		}
@@ -255,13 +275,11 @@ int main()
 
 		/* Draw the histogram */
 		for (int i = 0; i < NFREQS; i++) {
-			int y = (int)(s.resy * freq_avgs_g[i]);
+			int y = s.resy * freq_bar_g[i] / FREQ_BAR_MAX;
 			SDL_SetRenderDrawColor(s.ren, 255, 0, 0, 255);
 			SDL_RenderDrawLine(s.ren, NFREQS + i, s.resy - y,
 					   NFREQS + i, s.resy);
 		}
-
-		SDL_UnlockMutex(freq_mtx);
 
 		/* Green bars */
 		SDL_SetRenderDrawColor(s.ren, 0, 255, 0, 255);
@@ -290,10 +308,8 @@ int main()
 
 late_err:
 thr_err:
-	SDL_DestroyMutex(freq_mtx);
-mtx_err:
 	state_destroy(&s);
 init_err:
-	printf("ERROR\n");
+	printf("ERROR!!1\n");
 	return EXIT_FAILURE;
 }
